@@ -1,3 +1,5 @@
+source: https://deepwiki.com/sandorkollar/AGDB
+
 ## Az AGDB áttekintése
 
 Az AGDB egy Zig nyelven írt, nagy teljesítményű, állandó adatbázis-motor, amelyet a modern hardverekhez és a felhőalapú többfelhasználós környezetekhez terveztek. Réteges architektúrával rendelkezik, amely az alacsony szintű hardveres optimalizálásoktól (SIMD, GPU, NUMA) egészen egy olyan magas szintű felhőszolgáltatásig terjed, amely képes több ezer felhasználói munkaterhelés elszigetelésére Linux-alapú homokozótechnika segítségével.
