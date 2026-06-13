@@ -23,6 +23,7 @@ pub const Bm25Index = struct {
     postings: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Posting)),
     doc_lengths: std.AutoHashMapUnmanaged(u64, u32),
     doc_id_set: std.AutoHashMapUnmanaged(u64, void),
+    doc_terms: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(u64)),
     total_terms: u64,
     total_docs: u64,
     mutex: std.Thread.Mutex,
@@ -36,6 +37,7 @@ pub const Bm25Index = struct {
             .postings = .{},
             .doc_lengths = .{},
             .doc_id_set = .{},
+            .doc_terms = .{},
             .total_terms = 0,
             .total_docs = 0,
             .mutex = .{},
@@ -50,6 +52,11 @@ pub const Bm25Index = struct {
         self.postings.deinit(self.allocator);
         self.doc_lengths.deinit(self.allocator);
         self.doc_id_set.deinit(self.allocator);
+        var dt_it = self.doc_terms.iterator();
+        while (dt_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.doc_terms.deinit(self.allocator);
     }
 
     pub fn addDocument(self: *Self, doc_id: u64, text: []const u8) !void {
@@ -78,6 +85,9 @@ pub const Bm25Index = struct {
             doc_len += 1;
         }
 
+        var term_list: std.ArrayListUnmanaged(u64) = .{};
+        errdefer term_list.deinit(self.allocator);
+
         var tf_it = tf_counts.iterator();
         while (tf_it.next()) |tf_entry| {
             const term_hash = tf_entry.key_ptr.*;
@@ -87,6 +97,7 @@ pub const Bm25Index = struct {
                 gop.value_ptr.* = .{};
             }
             try gop.value_ptr.append(self.allocator, Posting{ .doc_id = doc_id, .tf = tf });
+            try term_list.append(self.allocator, term_hash);
         }
 
         try self.doc_lengths.put(self.allocator, doc_id, doc_len);
@@ -95,19 +106,25 @@ pub const Bm25Index = struct {
             self.total_docs += 1;
         }
         self.total_terms += doc_len;
+        try self.doc_terms.put(self.allocator, doc_id, term_list);
     }
 
     fn removeDocumentLocked(self: *Self, doc_id: u64) !void {
         const length_entry = self.doc_lengths.get(doc_id) orelse return;
-        var it = self.postings.iterator();
-        while (it.next()) |entry| {
-            var i: usize = 0;
-            while (i < entry.value_ptr.items.len) {
-                if (entry.value_ptr.items[i].doc_id == doc_id) {
-                    _ = entry.value_ptr.swapRemove(i);
-                    continue;
+        if (self.doc_terms.fetchRemove(doc_id)) |dt| {
+            var term_list = dt.value;
+            defer term_list.deinit(self.allocator);
+            for (term_list.items) |term_hash| {
+                if (self.postings.getPtr(term_hash)) |list_ptr| {
+                    var i: usize = 0;
+                    while (i < list_ptr.items.len) {
+                        if (list_ptr.items[i].doc_id == doc_id) {
+                            _ = list_ptr.swapRemove(i);
+                            continue;
+                        }
+                        i += 1;
+                    }
                 }
-                i += 1;
             }
         }
         _ = self.doc_lengths.remove(doc_id);
@@ -270,6 +287,11 @@ pub const Bm25Index = struct {
                 const doc_id = try r.readInt(u64, .little);
                 const tf = try r.readInt(u32, .little);
                 list.appendAssumeCapacity(.{ .doc_id = doc_id, .tf = tf });
+                const dt_gop = try self.doc_terms.getOrPut(self.allocator, doc_id);
+                if (!dt_gop.found_existing) {
+                    dt_gop.value_ptr.* = .{};
+                }
+                try dt_gop.value_ptr.append(self.allocator, term_hash);
             }
             try self.postings.put(self.allocator, term_hash, list);
         }

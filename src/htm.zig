@@ -51,36 +51,15 @@ pub fn xend() void {
     );
 }
 
-pub fn xabort(imm: u8) noreturn {
+pub fn xabort(comptime imm: u8) noreturn {
     if (!comptime is_x86_64) {
         @panic("xabort on non-x86_64");
     }
-    switch (imm) {
-        0 => asm volatile (
-            \\.byte 0xC6, 0xF8, 0x00
-            :
-            :
-            : "memory"
-        ),
-        1 => asm volatile (
-            \\.byte 0xC6, 0xF8, 0x01
-            :
-            :
-            : "memory"
-        ),
-        2 => asm volatile (
-            \\.byte 0xC6, 0xF8, 0x02
-            :
-            :
-            : "memory"
-        ),
-        else => asm volatile (
-            \\.byte 0xC6, 0xF8, 0xFF
-            :
-            :
-            : "memory"
-        ),
-    }
+    asm volatile (std.fmt.comptimePrint(".byte 0xC6, 0xF8, 0x{X:0>2}", .{imm})
+        :
+        :
+        : "memory"
+    );
     unreachable;
 }
 
@@ -200,8 +179,11 @@ pub fn HTMTransaction(comptime lock_type: type) type {
         }
 
         fn isMutexLocked(lock: *lock_type) bool {
-            _ = lock;
-            return false;
+            if (lock.tryLock()) {
+                lock.unlock();
+                return false;
+            }
+            return true;
         }
     };
 }

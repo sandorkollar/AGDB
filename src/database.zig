@@ -145,14 +145,14 @@ pub const Database = struct {
         };
 
         if (config.enable_rank_index) {
-            const ri = effective_alloc.create(rank_index_mod.RankIndex) catch null;
-            if (ri) |r| {
-                r.* = rank_index_mod.RankIndex.init(effective_alloc, .{}) catch blk: {
+            if (effective_alloc.create(rank_index_mod.RankIndex)) |r| {
+                if (rank_index_mod.RankIndex.init(effective_alloc, .{})) |ri_val| {
+                    r.* = ri_val;
+                    self.rank_index = r;
+                } else |_| {
                     effective_alloc.destroy(r);
-                    break :blk undefined;
-                };
-                self.rank_index = r;
-            }
+                }
+            } else |_| {}
         }
 
         return self;
@@ -176,8 +176,6 @@ pub const Database = struct {
         self.bm25.deinit();
         self.vec.deinit();
         self.allocator.free(self.data_dir_owned);
-        const a = self.config.jit_alloc == null;
-        _ = a;
         const outer = if (self.config.jit_alloc != null) self.config.jit_alloc.?.backing else self.allocator;
         outer.destroy(self);
     }
@@ -207,7 +205,7 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const id = self.next_id;
-        self.next_id += 1;
+        self.next_id +|= 1;
         return id;
     }
 
@@ -239,6 +237,9 @@ pub const Database = struct {
         if (stored.embedding == null and self.config.auto_embed and stored.body.len > 0) {
             stored.embedding = try vector_mod.hashEmbed(self.allocator, stored.body, self.config.embedding_dim);
         }
+        errdefer if (record.embedding == null and stored.embedding != null) {
+            self.allocator.free(stored.embedding.?);
+        };
 
         const key_buf = try idKey(self.allocator, assigned_id);
         defer self.allocator.free(key_buf);

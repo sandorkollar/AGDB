@@ -105,7 +105,7 @@ pub const NumaTopology = struct {
         while (n < MAX_NUMA_NODES) : (n += 1) {
             var path_buf: [128]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/node/node{d}", .{n}) catch break;
-            std.fs.cwd().access(path, .{}) catch break;
+            std.fs.cwd().access(path, .{}) catch continue;
             self.nodes[n].node_id = n;
             self.loadNodeMeminfo(n);
             self.loadNodeCpus(n);
@@ -294,7 +294,7 @@ pub fn setThreadAffinityNode(topo: *const NumaTopology, node: u32) bool {
     return @as(isize, @bitCast(ret)) == 0;
 }
 
-pub fn allocaOnNode(allocator: std.mem.Allocator, size: usize, node: u32) ![]u8 {
+pub fn allocOnNode(allocator: std.mem.Allocator, size: usize, node: u32) ![]u8 {
     const buf = try allocator.alloc(u8, size);
     @memset(buf, 0);
     if (node != INVALID_NODE) {
@@ -319,7 +319,7 @@ pub const NumaAwareAllocator = struct {
     }
 
     pub fn alloc(self: *Self, size: usize) ![]u8 {
-        return allocaOnNode(self.backing, size, self.preferred_node);
+        return allocOnNode(self.backing, size, self.preferred_node);
     }
 
     pub fn free(self: *Self, buf: []u8) void {

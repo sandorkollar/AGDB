@@ -483,7 +483,11 @@ pub const KvStore = struct {
         std.fs.cwd().deleteFile(tmp_path) catch {};
 
         var tmp = try std.fs.cwd().createFile(tmp_path, .{ .read = true });
-        errdefer tmp.close();
+        var tmp_open = true;
+        errdefer {
+            if (tmp_open) tmp.close();
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+        }
 
         var new_header = FileHeader{
             .magic = MAGIC,
@@ -562,10 +566,12 @@ pub const KvStore = struct {
         try tmp.writeAll(hdr_bytes);
         try tmp.sync();
         tmp.close();
+        tmp_open = false;
 
-        self.file.close();
         try std.fs.cwd().rename(tmp_path, self.path);
-        self.file = try std.fs.cwd().openFile(self.path, .{ .mode = .read_write });
+        const new_file = try std.fs.cwd().openFile(self.path, .{ .mode = .read_write });
+        self.file.close();
+        self.file = new_file;
         self.file_size = offset;
         self.header = new_header;
 

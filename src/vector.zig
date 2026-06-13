@@ -286,10 +286,9 @@ fn manhattanDistance(a: []const f32, b: []const f32) f32 {
 pub fn hashEmbed(allocator: std.mem.Allocator, text: []const u8, dim: u32) ![]f32 {
     const out = try allocator.alloc(f32, dim);
     @memset(out, 0);
-    if (text.len == 0) return out;
+    if (text.len == 0 or dim == 0) return out;
 
     var i: usize = 0;
-    var count: u32 = 0;
     while (i < text.len) {
         const start = i;
         while (i < text.len) {
@@ -306,7 +305,6 @@ pub fn hashEmbed(allocator: std.mem.Allocator, text: []const u8, dim: u32) ![]f3
             const sign: f32 = if (h2 & 1 == 0) 1.0 else -1.0;
             const idx: usize = @intCast(h1 % dim);
             out[idx] += sign;
-            count += 1;
         }
         while (i < text.len) {
             const c = text[i];

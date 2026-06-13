@@ -368,6 +368,7 @@ pub const SSI = struct {
         }
         if (heap.peek()) |top| {
             if (similarity <= top.score) {
+                allocator.free(ranked.tokens);
                 return;
             }
         }

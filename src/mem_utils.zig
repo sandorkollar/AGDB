@@ -184,11 +184,11 @@ pub const Arena = struct {
         return self.offset;
     }
 
-    pub fn remaining(self: *Arena) usize {
+    pub fn remaining(self: *Arena) error{CorruptedArena}!usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.offset > self.buffer.len) {
-            std.debug.panic("Arena offset corrupted", .{});
+            return error.CorruptedArena;
         }
         return self.buffer.len - self.offset;
     }

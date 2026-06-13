@@ -93,6 +93,9 @@ pub const PersistentHeap = struct {
         }
 
         const pool_uuid = heap_header.getPoolUUID();
+        if (pool_uuid == 0) {
+            return error.InvalidPoolUUID;
+        }
         const page_count = try pageCountForSize(mapped_size);
         const dirty_pages = try allocator.alloc(bool, page_count);
         errdefer allocator.free(dirty_pages);
@@ -213,24 +216,72 @@ pub const PersistentHeap = struct {
         if (size == 0) {
             return error.InvalidSize;
         }
+        if (!isPowerOfTwo(alignment)) {
+            return error.InvalidAlignment;
+        }
 
-        const minimum_offset = try alignTo(minimumHeapSize(), alignment);
-        const current_used = @max(self.header.used_size, minimum_offset);
-        const aligned_offset = try alignTo(current_used, alignment);
-        const end_offset = try checkedAddU64(aligned_offset, size);
+        const oh_size = objectHeaderSize();
+        const want = @max(size, header.MIN_BLOCK_SIZE);
+
+        if (want <= header.MAX_SMALL_SIZE and alignment <= header.MIN_ALIGNMENT) {
+            const class_idx = header.sizeClassIndex(want);
+            if (class_idx < header.NUM_SIZE_CLASSES) {
+                const class_size = header.SIZE_CLASSES[class_idx];
+                const storage = self.freeListStorage();
+                const head = storage[class_idx];
+                if (head != 0) {
+                    header.freeListUnlink(self.base_addr.ptr, &storage[class_idx], head);
+                    try self.writeObjectHeaderAt(head, class_size);
+                    try self.flushFreeListMetadata();
+                    try self.flushRangeAt(head, oh_size);
+                    return pointer.PersistentPtr{
+                        .pool_uuid = self.pool_uuid,
+                        .offset = head,
+                    };
+                }
+                return self.bumpBlock(class_size, alignment);
+            }
+        }
+
+        return self.bumpBlock(want, alignment);
+    }
+
+    fn bumpBlock(self: *PersistentHeap, block_size: u64, alignment: u64) !pointer.PersistentPtr {
+        const oh_size = objectHeaderSize();
+        const actual_alignment = @max(alignment, header.MIN_ALIGNMENT);
+        const free_list_end = freeListRegionEnd();
+        const minimum_offset = try alignTo(minimumHeapSize(), actual_alignment);
+        const floor = @max(minimum_offset, free_list_end);
+        const current_used = @max(self.header.used_size, floor);
+        const aligned_offset = try alignTo(current_used, actual_alignment);
+        const total = try checkedAddU64(oh_size, block_size);
+        const end_offset = try checkedAddU64(aligned_offset, total);
 
         if (end_offset > self.size) {
             return error.OutOfMemory;
         }
 
+        try self.writeObjectHeaderAt(aligned_offset, block_size);
         self.header.used_size = end_offset;
         self.header.updateChecksum();
         try self.markDirty(0, heapHeaderSize());
+        try self.flushRangeAt(0, heapHeaderSize());
+        try self.flushRangeAt(aligned_offset, oh_size);
 
         return pointer.PersistentPtr{
             .pool_uuid = self.pool_uuid,
             .offset = aligned_offset,
         };
+    }
+
+    fn writeObjectHeaderAt(self: *PersistentHeap, offset: u64, block_size: u64) !void {
+        const oh_size = objectHeaderSize();
+        try checkRange(self.size, offset, oh_size);
+        const idx = try u64ToUsize(offset);
+        const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(self.base_addr.ptr + idx));
+        obj_header.* = header.ObjectHeader.init(block_size, 0);
+        obj_header.updateChecksum();
+        try self.markDirty(offset, oh_size);
     }
 
     pub fn deallocate(
@@ -239,11 +290,33 @@ pub const PersistentHeap = struct {
         ptr: pointer.PersistentPtr,
     ) !void {
         _ = tx;
-        _ = self;
 
         if (ptr.isNull()) {
             return;
         }
+
+        const offset = ptr.offset;
+        const oh_size = objectHeaderSize();
+        if (offset < freeListRegionEnd()) {
+            return error.OutOfBounds;
+        }
+        try checkRange(self.size, offset, oh_size);
+
+        const idx = try u64ToUsize(offset);
+        const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(self.base_addr.ptr + idx));
+        try obj_header.validate();
+        if (obj_header.isFreed()) {
+            return;
+        }
+
+        const block_size: u64 = @intCast(obj_header.size);
+        obj_header.setFreed(true);
+        obj_header.updateChecksum();
+        try self.markDirty(offset, oh_size);
+
+        try self.freeListInsert(offset, block_size);
+        try self.flushFreeListMetadata();
+        try self.flushRangeAt(offset, oh_size);
     }
 
     pub fn write(self: *PersistentHeap, offset: u64, data: []const u8) !void {
@@ -435,7 +508,7 @@ pub const PersistentHeap = struct {
         try posix.fsync(self.file.handle);
     }
 
-    pub fn expand(self: *PersistentHeap, new_size: u64) !void {
+    fn expandCopy(self: *PersistentHeap, new_size: u64) !void {
         if (new_size <= self.size) {
             return;
         }
@@ -529,53 +602,155 @@ pub const PersistentHeap = struct {
         return self.header.transaction_id;
     }
 
+    fn freeListStorage(self: *PersistentHeap) *[header.NUM_SIZE_CLASSES]u64 {
+        const idx: usize = @intCast(header.FREE_LIST_STORAGE_OFFSET);
+        return @ptrCast(@alignCast(self.base_addr.ptr + idx));
+    }
+
+    fn freeListHeadFor(self: *PersistentHeap, size: u64) *u64 {
+        if (size <= header.MAX_SMALL_SIZE) {
+            const class_idx = header.sizeClassIndex(size);
+            if (class_idx < header.NUM_SIZE_CLASSES) {
+                const storage = self.freeListStorage();
+                return &storage[class_idx];
+            }
+        }
+        return &self.header.allocator_offset;
+    }
+
+    fn freeListHeadValue(self: *const PersistentHeap, size: u64) u64 {
+        if (size <= header.MAX_SMALL_SIZE) {
+            const class_idx = header.sizeClassIndex(size);
+            if (class_idx < header.NUM_SIZE_CLASSES) {
+                const idx: usize = @intCast(header.FREE_LIST_STORAGE_OFFSET);
+                const storage: *const [header.NUM_SIZE_CLASSES]u64 = @ptrCast(@alignCast(self.base_addr.ptr + idx));
+                return storage[class_idx];
+            }
+        }
+        return self.header.allocator_offset;
+    }
+
+    fn reconcileWatermark(self: *PersistentHeap, offset: u64, size: u64) !void {
+        const with_header = try checkedAddU64(offset, objectHeaderSize());
+        const block_end = try checkedAddU64(with_header, size);
+        var changed = false;
+
+        const md_idx: usize = @intCast(header.HEADER_SIZE);
+        const md: *header.AllocatorMetadata = @ptrCast(@alignCast(self.base_addr.ptr + md_idx));
+        if (md.magic == header.AllocatorMetadata.ALLOCATOR_MAGIC and block_end > md.free_heap_offset) {
+            md.free_heap_offset = block_end;
+            md.updateChecksum();
+            changed = true;
+        }
+
+        if (block_end > self.header.used_size) {
+            self.header.used_size = block_end;
+            self.header.updateChecksum();
+            changed = true;
+        }
+
+        if (changed) {
+            const end = freeListRegionEnd();
+            try self.markDirty(0, end);
+            try self.flushRangeAt(0, end);
+        }
+    }
+
     pub fn markAllocated(self: *PersistentHeap, offset: u64, size: u64) !void {
-        _ = self;
-        _ = offset;
-        _ = size;
+        try self.reconcileWatermark(offset, size);
     }
 
     pub fn markFreed(self: *PersistentHeap, offset: u64, size: u64) !void {
-        _ = self;
-        _ = offset;
-        _ = size;
+        try self.reconcileWatermark(offset, size);
     }
 
     pub fn freeListInsert(self: *PersistentHeap, offset: u64, size: u64) !void {
-        _ = self;
-        _ = offset;
-        _ = size;
+        if (offset == 0) {
+            return;
+        }
+        const head = self.freeListHeadFor(size);
+        header.freeListPush(self.base_addr.ptr, head, offset, size);
+        try self.markDirty(offset, @sizeOf(header.FreeListNode));
     }
 
     pub fn freeListRemove(self: *PersistentHeap, offset: u64, size: u64) !void {
-        _ = self;
-        _ = offset;
-        _ = size;
+        if (offset == 0) {
+            return;
+        }
+        const head = self.freeListHeadFor(size);
+        header.freeListUnlink(self.base_addr.ptr, head, offset);
+        try self.markDirty(offset, @sizeOf(header.FreeListNode));
     }
 
     pub fn flushFreeListMetadata(self: *PersistentHeap) !void {
-        _ = self;
+        const end = freeListRegionEnd();
+        try self.markDirty(0, end);
+        try self.flushRangeAt(0, end);
     }
 
     pub fn findObjectHeaderOffset(self: *const PersistentHeap, data_offset: u64) !u64 {
-        _ = self;
-        return data_offset;
+        const oh_size = objectHeaderSize();
+        const min_off = minimumHeapSize();
+        if (data_offset < min_off or data_offset > self.size) {
+            return error.OutOfBounds;
+        }
+
+        const step = header.MIN_ALIGNMENT;
+        var candidate = (data_offset / step) * step;
+        while (true) {
+            if (candidate >= min_off and candidate + oh_size <= self.size) {
+                const idx = try u64ToUsize(candidate);
+                const obj_header: *const header.ObjectHeader = @ptrCast(@alignCast(self.base_addr.ptr + idx));
+                if (obj_header.hasValidMagic()) {
+                    return candidate;
+                }
+            }
+            if (candidate < min_off + step) {
+                break;
+            }
+            candidate -= step;
+        }
+        return error.ObjectHeaderNotFound;
     }
 
     pub fn isInFreeList(self: *const PersistentHeap, offset: u64, size: u64) bool {
-        _ = self;
-        _ = offset;
-        _ = size;
-        return false;
+        if (offset == 0) {
+            return false;
+        }
+        const head_val = self.freeListHeadValue(size);
+        return header.freeListContains(self.base_addr.ptr, head_val, offset);
     }
 
     pub fn shrink(self: *PersistentHeap, new_size: u64) !void {
-        _ = self;
-        _ = new_size;
+        const free_list_end = freeListRegionEnd();
+        if (new_size < free_list_end) {
+            return;
+        }
+        var changed = false;
+
+        const md_idx: usize = @intCast(header.HEADER_SIZE);
+        const md: *header.AllocatorMetadata = @ptrCast(@alignCast(self.base_addr.ptr + md_idx));
+        if (md.magic == header.AllocatorMetadata.ALLOCATOR_MAGIC and md.free_heap_offset > new_size) {
+            md.free_heap_offset = new_size;
+            md.updateChecksum();
+            changed = true;
+        }
+
+        if (self.header.used_size > new_size) {
+            self.header.used_size = new_size;
+            self.header.updateChecksum();
+            changed = true;
+        }
+
+        if (changed) {
+            try self.markDirty(0, free_list_end);
+            try self.flushRangeAt(0, free_list_end);
+        }
     }
 
     pub fn clwbRange(self: *PersistentHeap, offset: u64, len: u64) !void {
         if (len == 0) return;
+        try checkRange(self.size, offset, len);
         const base = @intFromPtr(self.base_addr.ptr);
         const start = base + try u64ToUsize(offset);
         const end = start + try u64ToUsize(len);
@@ -598,7 +773,7 @@ pub const PersistentHeap = struct {
 
     pub fn ntStoreRange(self: *PersistentHeap, offset: u64, data: []const u8) !void {
         if (data.len == 0) return;
-        if (offset + data.len > self.size) return error.OutOfBounds;
+        try checkRange(self.size, offset, try usizeToU64(data.len));
         const dest = self.base_addr.ptr + try u64ToUsize(offset);
         movntStore(dest, data);
         sfence();
@@ -633,17 +808,25 @@ pub const PersistentHeap = struct {
         }
     }
 
-    pub fn mremapExpand(self: *PersistentHeap, new_size: u64) !void {
-        if (!comptime is_linux_os) return self.expand(new_size);
+    pub fn expand(self: *PersistentHeap, new_size: u64) !void {
+        if (!comptime is_linux_os) return self.expandCopy(new_size);
         if (new_size <= self.size) return;
 
         const aligned_new_size = try normalizeHeapSize(new_size);
         if (aligned_new_size <= self.size) return;
 
-        try self.file.setEndPos(aligned_new_size);
+        const new_page_count = try pageCountForSize(aligned_new_size);
+        const new_dirty_pages = try self.allocator.alloc(bool, new_page_count);
+        @memset(new_dirty_pages, false);
 
         const old_len = try u64ToUsize(self.mapped_size);
         const new_len = try u64ToUsize(aligned_new_size);
+        const old_size_usize = try u64ToUsize(self.size);
+
+        self.file.setEndPos(aligned_new_size) catch |err| {
+            self.allocator.free(new_dirty_pages);
+            return err;
+        };
 
         const new_ptr = linux_mremap(
             @intFromPtr(self.base_addr.ptr),
@@ -652,15 +835,11 @@ pub const PersistentHeap = struct {
         );
 
         if (new_ptr == std.math.maxInt(usize)) {
-            return self.expand(new_size);
+            self.allocator.free(new_dirty_pages);
+            return self.expandCopy(new_size);
         }
 
-        const new_page_count = try pageCountForSize(aligned_new_size);
-        const new_dirty_pages = try self.allocator.alloc(bool, new_page_count);
-        @memset(new_dirty_pages, false);
         const old_dirty_pages = self.dirty_pages;
-
-        const old_size_usize = try u64ToUsize(self.size);
         const p: [*]align(page_size_min) u8 = @ptrFromInt(new_ptr);
         const new_base = p[0..new_len];
         if (new_len > old_size_usize) {
@@ -775,12 +954,25 @@ fn alignToPageSize(value: u64) !u64 {
     return alignTo(value, pageSize());
 }
 
+var cached_page_size = std.atomic.Value(u64).init(0);
+
 fn pageSize() u64 {
-    return @intCast(std.heap.pageSize());
+    const cached = cached_page_size.load(.monotonic);
+    if (cached != 0) {
+        return cached;
+    }
+    const ps: u64 = @intCast(std.heap.pageSize());
+    cached_page_size.store(ps, .monotonic);
+    return ps;
 }
 
 fn heapHeaderSize() u64 {
     return @intCast(@sizeOf(header.HeapHeader));
+}
+
+fn freeListRegionEnd() u64 {
+    const storage_bytes: u64 = @as(u64, @intCast(header.NUM_SIZE_CLASSES)) * @sizeOf(u64);
+    return header.FREE_LIST_STORAGE_OFFSET + storage_bytes;
 }
 
 fn objectHeaderSize() u64 {
@@ -849,36 +1041,42 @@ fn constPtrAt(base_addr: []align(page_size_min) u8, offset: u64) ![]const u8 {
 }
 
 fn openOrCreateFile(path: []const u8, size: u64) !OpenResult {
-    if (std.fs.cwd().openFile(path, .{ .mode = .read_write })) |existing| {
-        errdefer existing.close();
+    while (true) {
+        if (std.fs.cwd().openFile(path, .{ .mode = .read_write })) |existing| {
+            errdefer existing.close();
 
-        const stat = try existing.stat();
-        const target_size = try normalizeHeapSize(@max(stat.size, size));
+            const stat = try existing.stat();
+            const target_size = try normalizeHeapSize(@max(stat.size, size));
 
-        if (stat.size != target_size) {
-            try existing.setEndPos(target_size);
-        }
-
-        return .{
-            .file = existing,
-            .needs_init = stat.size == 0,
-            .map_size = target_size,
-        };
-    } else |err| switch (err) {
-        error.FileNotFound => {
-            const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
-            errdefer file.close();
-
-            const target_size = try normalizeHeapSize(size);
-            try file.setEndPos(target_size);
+            if (stat.size != target_size) {
+                try existing.setEndPos(target_size);
+            }
 
             return .{
-                .file = file,
-                .needs_init = true,
+                .file = existing,
+                .needs_init = stat.size == 0,
                 .map_size = target_size,
             };
-        },
-        else => return err,
+        } else |open_err| switch (open_err) {
+            error.FileNotFound => {
+                if (std.fs.cwd().createFile(path, .{ .read = true, .truncate = false, .exclusive = true })) |file| {
+                    errdefer file.close();
+
+                    const target_size = try normalizeHeapSize(size);
+                    try file.setEndPos(target_size);
+
+                    return .{
+                        .file = file,
+                        .needs_init = true,
+                        .map_size = target_size,
+                    };
+                } else |create_err| switch (create_err) {
+                    error.PathAlreadyExists => continue,
+                    else => return create_err,
+                }
+            },
+            else => return open_err,
+        }
     }
 }
 

@@ -76,8 +76,8 @@ pub const RankIndex = struct {
         const position = self.next_position;
         self.next_position += 1;
         try self.ssi.addSequence(tokens, position, true);
-        try self.doc_token_map.put(self.allocator, doc_id, tokens);
         try self.doc_positions.put(self.allocator, doc_id, position);
+        try self.doc_token_map.put(self.allocator, doc_id, tokens);
     }
 
     pub fn removeDocument(self: *Self, doc_id: u64) void {

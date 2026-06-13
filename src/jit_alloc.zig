@@ -234,7 +234,7 @@ pub fn jitCompileClassifier(code: *JITCode, policy: *const JITAllocPolicy) !Clas
         const threshold: u32 = @intCast(@min(policy.thresholds[i], 0xFFFFFFFF));
         const class: u8 = @intFromEnum(policy.classes[i]);
         try emit.emitCmpRdiImm32(threshold);
-        try emit.emitJa(5);
+        try emit.emitJa(10);
         try emit.emitMovEaxImm32(class);
         try emit.emitMovRspRbp();
         try emit.emitPopRbp();

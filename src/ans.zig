@@ -56,14 +56,16 @@ pub const SymbolStats = struct {
                 }
             }
         } else if (sum < ANS_SCALE) {
-            var deficit: u32 = ANS_SCALE - sum;
-            var i: usize = 0;
-            while (i < MAX_SYMBOLS and deficit > 0) : (i += 1) {
-                if (self.freq[i] > 0) {
-                    self.freq[i] += deficit;
-                    deficit = 0;
+            const deficit: u32 = ANS_SCALE - sum;
+            var max_idx: usize = 0;
+            var max_freq: u32 = 0;
+            for (self.freq, 0..) |f, idx| {
+                if (f > max_freq) {
+                    max_freq = f;
+                    max_idx = idx;
                 }
             }
+            self.freq[max_idx] += deficit;
         }
 
         self.buildCumFreq();
@@ -287,6 +289,7 @@ pub fn decompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     if (valid_symbols == 0) return error.InvalidFrequencyTable;
 
     const encoded = data[header_size..];
+    if (encoded.len < 8) return error.InvalidCompressedData;
     var decoder = RansDecoder.init(encoded, &stats);
 
     const out = try allocator.alloc(u8, orig_len);
@@ -311,7 +314,7 @@ pub const WCBuffer = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !WCBuffer {
-        const aligned_cap = std.mem.alignForward(usize, capacity, 64);
+        const aligned_cap = std.mem.alignForward(usize, @max(capacity, 1), 64);
         const buf = try allocator.alignedAlloc(u8, 64, aligned_cap);
         @memset(buf, 0);
         return Self{

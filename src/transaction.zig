@@ -189,7 +189,7 @@ pub const Transaction = struct {
             .state = .active,
             .operations = undefined,
             .wal_tx = wal_tx,
-            .start_time = std.time.timestamp(),
+            .start_time = std.time.milliTimestamp(),
             .start_tsc = start,
             .allocator = undefined,
             .read_set = undefined,
@@ -563,7 +563,7 @@ pub const TransactionManager = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const current_time = std.time.timestamp();
+        const current_time = std.time.milliTimestamp();
         var timed_out: usize = 0;
 
         var to_remove = std.ArrayList(u64).init(self.allocator);
@@ -572,7 +572,7 @@ pub const TransactionManager = struct {
         var iter = self.active_transactions.iterator();
         while (iter.next()) |entry| {
             const tx = entry.value_ptr;
-            const elapsed_ms = @as(u64, @intCast((current_time - tx.start_time) * 1000));
+            const elapsed_ms: u64 = if (current_time > tx.start_time) @intCast(current_time - tx.start_time) else 0;
             if (elapsed_ms > timeout_ms) {
                 try to_remove.append(entry.key_ptr.*);
                 timed_out += 1;

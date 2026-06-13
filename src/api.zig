@@ -394,7 +394,7 @@ pub const PersistentStore = struct {
             .allocator = alloc_inst,
             .tx_manager = tx_mgr,
             .gc = gc_inst,
-            .resident_objects = try pointer.ResidentObjectTable.init(allocator_ptr, base_addr, pool_uuid, 1024),
+            .resident_objects = try pointer.ResidentObjectTable.init(allocator_ptr, base_addr, pool_uuid, alloc_inst.heap.getSize(), 1024),
             .root = null,
             .allocator_mem = allocator_ptr,
         };

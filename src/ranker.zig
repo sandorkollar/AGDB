@@ -930,6 +930,10 @@ pub const Ranker = struct {
         var threads = try self.allocator.alloc(std.Thread, effective_threads);
         defer self.allocator.free(threads);
 
+        var spawned_flags = try self.allocator.alloc(bool, effective_threads);
+        defer self.allocator.free(spawned_flags);
+        @memset(spawned_flags, false);
+
         var offset: usize = 0;
         var t: usize = 0;
         while (t < effective_threads) : (t += 1) {
@@ -947,7 +951,6 @@ pub const Ranker = struct {
         }
 
         t = 0;
-        var spawned: usize = 0;
         while (t < effective_threads) : (t += 1) {
             threads[t] = std.Thread.spawn(.{}, struct {
                 fn work(ctx: *ThreadContext) void {
@@ -964,15 +967,14 @@ pub const Ranker = struct {
                 while (si < contexts[t].end) : (si += 1) {
                     scores[si] = self.scoreSequence(sequences[si], ssi) catch 0.0;
                 }
-                spawned = t;
                 continue;
             };
-            spawned = t + 1;
+            spawned_flags[t] = true;
         }
 
         t = 0;
-        while (t < spawned) : (t += 1) {
-            threads[t].join();
+        while (t < effective_threads) : (t += 1) {
+            if (spawned_flags[t]) threads[t].join();
         }
 
         var had_error = false;

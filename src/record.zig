@@ -99,6 +99,7 @@ pub const RecordReader = struct {
         const created = try r.readInt(i64, .little);
         const updated = try r.readInt(i64, .little);
         const tag_count = try r.readInt(u32, .little);
+        if (tag_count > (data.len - stream.pos) / 2) return error.InvalidRecord;
         const tags = try allocator.alloc([]const u8, tag_count);
         errdefer {
             for (tags) |t| allocator.free(t);
@@ -113,12 +114,14 @@ pub const RecordReader = struct {
             tags[i] = t;
         }
         const body_len = try r.readInt(u32, .little);
+        if (body_len > data.len - stream.pos) return error.InvalidRecord;
         const body = try allocator.alloc(u8, body_len);
         errdefer allocator.free(body);
         try r.readNoEof(body);
         const emb_len = try r.readInt(u32, .little);
         var embedding: ?[]f32 = null;
         if (emb_len > 0) {
+            if (emb_len > (data.len - stream.pos) / 4) return error.InvalidRecord;
             const emb = try allocator.alloc(f32, emb_len);
             errdefer allocator.free(emb);
             var j: u32 = 0;

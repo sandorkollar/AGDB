@@ -19,7 +19,7 @@ const min_page_align: usize = switch (builtin.os.tag) {
 
 pub const MemoryConfig = struct {
     pub const PAGE_SIZE: usize = min_page_align;
-    pub const CACHE_LINE_SIZE: usize = 128;
+    pub const CACHE_LINE_SIZE: usize = 64;
 };
 
 pub const PageSize: usize = MemoryConfig.PAGE_SIZE;
@@ -1016,17 +1016,28 @@ pub const LockFreeQueue = struct {
     head: usize,
     tail: usize,
     mask: usize,
+    capacity: usize,
+    sequences: []usize,
     buffer: []usize,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, capacity: usize) !LockFreeQueue {
         if (capacity < 2 or !isPow2(capacity)) return error.InvalidSize;
         const buffer = try allocator.alloc(usize, capacity);
+        errdefer allocator.free(buffer);
         @memset(buffer, 0);
+        const sequences = try allocator.alloc(usize, capacity);
+        @memset(sequences, 0);
+        var i: usize = 0;
+        while (i < capacity) : (i += 1) {
+            @atomicStore(usize, &sequences[i], i, .monotonic);
+        }
         return .{
             .head = 0,
             .tail = 0,
             .mask = capacity - 1,
+            .capacity = capacity,
+            .sequences = sequences,
             .buffer = buffer,
             .allocator = allocator,
         };
@@ -1034,36 +1045,58 @@ pub const LockFreeQueue = struct {
 
     pub fn deinit(self: *LockFreeQueue) void {
         const buf = self.buffer;
+        const seq = self.sequences;
         self.buffer = emptySlice(usize);
+        self.sequences = emptySlice(usize);
         self.head = 0;
         self.tail = 0;
         self.mask = 0;
+        self.capacity = 0;
         if (buf.len != 0) self.allocator.free(buf);
+        if (seq.len != 0) self.allocator.free(seq);
+    }
+
+    fn sequenceDiff(a: usize, b: usize) isize {
+        return @as(isize, @bitCast(a -% b));
     }
 
     pub fn enqueue(self: *LockFreeQueue, item: *anyopaque) bool {
+        var pos = @atomicLoad(usize, &self.tail, .monotonic);
         while (true) {
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const next_tail = (tail + 1) & self.mask;
-            if (next_tail == head) return false;
-            self.buffer[tail] = @intFromPtr(item);
-            if (@cmpxchgWeak(usize, &self.tail, tail, next_tail, .acq_rel, .acquire) == null) {
-                return true;
+            const index = pos & self.mask;
+            const seq = @atomicLoad(usize, &self.sequences[index], .acquire);
+            const diff = sequenceDiff(seq, pos);
+            if (diff == 0) {
+                if (@cmpxchgWeak(usize, &self.tail, pos, pos +% 1, .monotonic, .monotonic) == null) {
+                    self.buffer[index] = @intFromPtr(item);
+                    @atomicStore(usize, &self.sequences[index], pos +% 1, .release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                return false;
+            } else {
+                pos = @atomicLoad(usize, &self.tail, .monotonic);
             }
         }
     }
 
     pub fn dequeue(self: *LockFreeQueue) ?*anyopaque {
+        var pos = @atomicLoad(usize, &self.head, .monotonic);
         while (true) {
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            if (head == tail) return null;
-            const value = self.buffer[head];
-            const next_head = (head + 1) & self.mask;
-            if (@cmpxchgWeak(usize, &self.head, head, next_head, .acq_rel, .acquire) == null) {
-                self.buffer[head] = 0;
-                return @ptrFromInt(value);
+            const index = pos & self.mask;
+            const seq = @atomicLoad(usize, &self.sequences[index], .acquire);
+            const diff = sequenceDiff(seq, pos +% 1);
+            if (diff == 0) {
+                if (@cmpxchgWeak(usize, &self.head, pos, pos +% 1, .monotonic, .monotonic) == null) {
+                    const value = self.buffer[index];
+                    self.buffer[index] = 0;
+                    @atomicStore(usize, &self.sequences[index], pos +% self.capacity, .release);
+                    return @ptrFromInt(value);
+                }
+            } else if (diff < 0) {
+                return null;
+            } else {
+                pos = @atomicLoad(usize, &self.head, .monotonic);
             }
         }
     }
@@ -1122,21 +1155,38 @@ pub const MutexStack = struct {
 };
 
 pub const LockFreeStack = struct {
-    top: usize,
+    head: u128,
     allocator: Allocator,
+    mutex: Mutex,
 
     const Node = struct {
         value: *anyopaque,
         next: usize,
     };
 
+    fn packHead(ptr: usize, counter: u64) u128 {
+        const low: u64 = @truncate(ptr);
+        return (@as(u128, counter) << 64) | @as(u128, low);
+    }
+
+    fn headPtr(value: u128) usize {
+        const low: u64 = @truncate(value);
+        return @intCast(low);
+    }
+
+    fn headCounter(value: u128) u64 {
+        return @truncate(value >> 64);
+    }
+
     pub fn init(allocator: Allocator) LockFreeStack {
-        return .{ .top = 0, .allocator = allocator };
+        return .{ .head = 0, .allocator = allocator, .mutex = .{} };
     }
 
     pub fn deinit(self: *LockFreeStack) void {
-        var cur = @atomicLoad(usize, &self.top, .acquire);
-        @atomicStore(usize, &self.top, 0, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cur = headPtr(self.head);
+        self.head = 0;
         while (cur != 0) {
             const node: *Node = @ptrFromInt(cur);
             cur = node.next;
@@ -1146,24 +1196,25 @@ pub const LockFreeStack = struct {
 
     pub fn push(self: *LockFreeStack, value: *anyopaque) !void {
         const node = try self.allocator.create(Node);
-        while (true) {
-            const old = @atomicLoad(usize, &self.top, .acquire);
-            node.* = .{ .value = value, .next = old };
-            if (@cmpxchgWeak(usize, &self.top, old, @intFromPtr(node), .acq_rel, .acquire) == null) return;
-        }
+        node.value = value;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const old = self.head;
+        node.next = headPtr(old);
+        self.head = packHead(@intFromPtr(node), headCounter(old) +% 1);
     }
 
     pub fn pop(self: *LockFreeStack) ?*anyopaque {
-        while (true) {
-            const old = @atomicLoad(usize, &self.top, .acquire);
-            if (old == 0) return null;
-            const node: *Node = @ptrFromInt(old);
-            if (@cmpxchgWeak(usize, &self.top, old, node.next, .acq_rel, .acquire) == null) {
-                const value = node.value;
-                self.allocator.destroy(node);
-                return value;
-            }
-        }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const old = self.head;
+        const old_ptr = headPtr(old);
+        if (old_ptr == 0) return null;
+        const node: *Node = @ptrFromInt(old_ptr);
+        self.head = packHead(node.next, headCounter(old) +% 1);
+        const value = node.value;
+        self.allocator.destroy(node);
+        return value;
     }
 };
 
@@ -2035,28 +2086,45 @@ pub fn semaphorePost(sem: *Semaphore) void {
 }
 
 pub fn compressMemory(data: []const u8, allocator: Allocator) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
+    var rle: std.ArrayListUnmanaged(u8) = .empty;
+    defer rle.deinit(allocator);
     var i: usize = 0;
     while (i < data.len) {
         const value = data[i];
         var run: usize = 1;
         while (i + run < data.len and data[i + run] == value and run < 255) : (run += 1) {}
-        try out.append(allocator, @intCast(run));
-        try out.append(allocator, value);
+        try rle.append(allocator, @intCast(run));
+        try rle.append(allocator, value);
         i += run;
     }
-    return try out.toOwnedSlice(allocator);
+    if (rle.items.len < data.len) {
+        const out = try allocator.alloc(u8, rle.items.len + 1);
+        out[0] = 1;
+        @memcpy(out[1..], rle.items);
+        return out;
+    }
+    const out = try allocator.alloc(u8, data.len + 1);
+    out[0] = 0;
+    @memcpy(out[1..], data);
+    return out;
 }
 
 pub fn decompressMemory(data: []const u8, allocator: Allocator) ![]u8 {
-    if (data.len % 2 != 0) return error.InvalidData;
+    if (data.len == 0) return error.InvalidData;
+    const tag = data[0];
+    const payload = data[1..];
+    if (tag == 0) {
+        return try allocator.dupe(u8, payload);
+    }
+    if (tag != 1) return error.InvalidData;
+    if (payload.len % 2 != 0) return error.InvalidData;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     var i: usize = 0;
-    while (i < data.len) : (i += 2) {
-        const run = data[i];
-        const value = data[i + 1];
+    while (i < payload.len) : (i += 2) {
+        const run = payload[i];
+        const value = payload[i + 1];
+        if (run == 0) return error.InvalidData;
         try out.appendNTimes(allocator, value, run);
     }
     return try out.toOwnedSlice(allocator);

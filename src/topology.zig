@@ -177,7 +177,7 @@ pub fn WorkStealDeque(comptime T: type) type {
         pub fn pop(self: *Self) ?T {
             const b = self.bottom.load(.acquire) - 1;
             self.bottom.store(b, .seq_cst);
-            const t = self.top.load(.acquire);
+            const t = self.top.load(.seq_cst);
             if (t <= b) {
                 const mask = @as(i64, @intCast(self.capacity - 1));
                 const item = self.buf[@intCast(b & mask)];

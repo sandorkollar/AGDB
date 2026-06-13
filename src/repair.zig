@@ -117,7 +117,7 @@ pub const HeapRepair = struct {
             }
         }
 
-        if (hdr.magic[0] != 'Z' or hdr.magic[1] != 'I' or hdr.magic[2] != 'G') {
+        if (!std.mem.eql(u8, hdr.magic[0..], header.HEAP_MAGIC[0..])) {
             self.errors_found += 1;
 
             const desc = try self.allocator.dupe(u8, "Invalid magic number in header");
@@ -329,6 +329,7 @@ pub const HeapRepair = struct {
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
             } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
+                if (free_node.size == 0) break;
                 offset += free_node.size;
             } else {
                 offset += 64;
@@ -395,16 +396,18 @@ pub const HeapRepair = struct {
             const obj: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
 
             if (obj.magic == header.ObjectHeader.OBJECT_MAGIC and obj.isFreed()) {
-                reclaimed += @sizeOf(header.ObjectHeader) + obj.size;
+                const block_size = @sizeOf(header.ObjectHeader) + obj.size;
+                reclaimed += block_size;
 
                 if (!self.options.dry_run) {
                     const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
-                    free_node.* = allocator_mod.FreeListNode.init(obj.size);
+                    free_node.* = allocator_mod.FreeListNode.init(block_size);
                 }
 
-                offset += @sizeOf(header.ObjectHeader) + obj.size;
+                offset += block_size;
             } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
+                if (free_node.size == 0) break;
                 offset += free_node.size;
             } else if (obj.magic == header.ObjectHeader.OBJECT_MAGIC) {
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
@@ -521,6 +524,7 @@ pub fn main() !void {
     defer repair_tool.deinit();
 
     const result = try repair_tool.repair();
+    defer alloc.free(result.message);
 
     try stdout.print("\n{s}\n\n", .{result.message});
 

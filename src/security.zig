@@ -384,7 +384,20 @@ pub const SecurityManager = struct {
 };
 
 fn hasAESNI() bool {
-    return true;
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return false;
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [in_eax] "{eax}" (@as(u32, 1)),
+          [in_ecx] "{ecx}" (@as(u32, 0)),
+    );
+    return (ecx & (@as(u32, 1) << 25)) != 0;
 }
 
 fn gfMulX(t: *[16]u8) void {
@@ -506,17 +519,62 @@ pub const TPM2Interface = struct {
         }
     }
 
+    fn derivePcrKey(self: *TPM2Interface, pcr_mask: u32) [32]u8 {
+        const Blake3 = crypto.hash.Blake3;
+        var hasher = Blake3.init(.{});
+        hasher.update("agdb-tpm2-seal-v1");
+        var idx: usize = 0;
+        while (idx < self.pcr_values.len) : (idx += 1) {
+            const mask_bit = @as(u32, 1) << @as(u5, @intCast(idx));
+            if ((pcr_mask & mask_bit) != 0) {
+                hasher.update(&self.pcr_values[idx]);
+            }
+        }
+        var key: [32]u8 = undefined;
+        hasher.final(&key);
+        return key;
+    }
+
     pub fn seal(self: *TPM2Interface, data: []const u8, pcr_mask: u32) ![]u8 {
-        _ = pcr_mask;
-        const sealed = try self.allocator.alloc(u8, data.len + 256);
-        @memcpy(sealed[0..data.len], data);
+        const Aead = crypto.aead.aes_gcm.Aes256Gcm;
+        const header_len = Aead.nonce_length + Aead.tag_length;
+
+        const key = self.derivePcrKey(pcr_mask);
+
+        const sealed = try self.allocator.alloc(u8, header_len + data.len);
+        errdefer self.allocator.free(sealed);
+
+        var nonce: [Aead.nonce_length]u8 = undefined;
+        crypto.random.bytes(&nonce);
+        @memcpy(sealed[0..Aead.nonce_length], &nonce);
+
+        var tag: [Aead.tag_length]u8 = undefined;
+        const ciphertext = sealed[header_len..];
+        Aead.encrypt(ciphertext, &tag, data, std.mem.asBytes(&pcr_mask), nonce, key);
+        @memcpy(sealed[Aead.nonce_length..header_len], &tag);
+
         return sealed;
     }
 
     pub fn unseal(self: *TPM2Interface, sealed_data: []const u8, pcr_mask: u32) ![]u8 {
-        _ = pcr_mask;
-        const unsealed = try self.allocator.alloc(u8, sealed_data.len - 256);
-        @memcpy(unsealed, sealed_data[0..unsealed.len]);
+        const Aead = crypto.aead.aes_gcm.Aes256Gcm;
+        const header_len = Aead.nonce_length + Aead.tag_length;
+        if (sealed_data.len < header_len) return error.InvalidSealedData;
+
+        const key = self.derivePcrKey(pcr_mask);
+
+        var nonce: [Aead.nonce_length]u8 = undefined;
+        @memcpy(&nonce, sealed_data[0..Aead.nonce_length]);
+
+        var tag: [Aead.tag_length]u8 = undefined;
+        @memcpy(&tag, sealed_data[Aead.nonce_length..header_len]);
+
+        const ciphertext = sealed_data[header_len..];
+        const unsealed = try self.allocator.alloc(u8, ciphertext.len);
+        errdefer self.allocator.free(unsealed);
+
+        Aead.decrypt(unsealed, ciphertext, tag, std.mem.asBytes(&pcr_mask), nonce, key) catch return error.UnsealVerificationFailed;
+
         return unsealed;
     }
 
@@ -571,19 +629,19 @@ pub const IntegrityVerifier = struct {
         self.page_hashes.deinit();
     }
 
-    pub fn computePageHash(self: *IntegrityVerifier, page_data: []const u8, page_idx: u64) [32]u8 {
+    pub fn computePageHash(self: *IntegrityVerifier, page_data: []const u8, page_idx: u64) ![32]u8 {
         var hasher = crypto.hash.sha2.Sha256.init(.{});
         hasher.update(page_data);
         var hash: [32]u8 = undefined;
         hasher.final(&hash);
 
-        self.page_hashes.put(page_idx, hash) catch {};
+        try self.page_hashes.put(page_idx, hash);
         return hash;
     }
 
     pub fn verifyPageHash(self: *IntegrityVerifier, page_data: []const u8, page_idx: u64) !bool {
         const expected = self.page_hashes.get(page_idx) orelse return error.HashNotFound;
-        const computed = self.computePageHash(page_data, page_idx);
+        const computed = try self.computePageHash(page_data, page_idx);
 
         if (!std.mem.eql(u8, &expected, &computed)) {
             return error.HashMismatch;
@@ -645,10 +703,28 @@ pub const IntegrityVerifier = struct {
     }
 
     pub fn verifyMerkleProof(self: *const IntegrityVerifier, page_idx: u64, proof: []const [32]u8) bool {
-        _ = self;
-        _ = page_idx;
-        _ = proof;
-        return true;
+        const root = self.getMerkleRoot() orelse return false;
+        var current = self.page_hashes.get(page_idx) orelse return false;
+        var index = page_idx;
+
+        for (proof) |sibling| {
+            var combined: [64]u8 = undefined;
+            if (index % 2 == 0) {
+                @memcpy(combined[0..32], &current);
+                @memcpy(combined[32..64], &sibling);
+            } else {
+                @memcpy(combined[0..32], &sibling);
+                @memcpy(combined[32..64], &current);
+            }
+
+            var hasher = crypto.hash.sha2.Sha256.init(.{});
+            hasher.update(&combined);
+            hasher.final(&current);
+
+            index /= 2;
+        }
+
+        return std.mem.eql(u8, &current, &root);
     }
 };
 

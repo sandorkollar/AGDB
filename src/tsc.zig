@@ -176,8 +176,11 @@ pub const HardwareRng = struct {
     pub fn nextInRange(self: *HardwareRng, min: u64, max: u64) u64 {
         if (min >= max) return min;
         const range = max - min;
-        const v = self.next64();
-        return min + (v % range);
+        const threshold = (0 -% range) % range;
+        while (true) {
+            const v = self.next64();
+            if (v >= threshold) return min + (v % range);
+        }
     }
 };
 

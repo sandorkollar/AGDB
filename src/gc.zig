@@ -212,6 +212,7 @@ pub const RefCountGC = struct {
 
         try self.wal.appendRecord(&tx, .ref_count_inc, ptr.offset, old_count);
         try self.heap.flushRange(ptr.offset + @sizeOf(header.ObjectHeader));
+        try self.wal.commitTransaction(&tx);
     }
 
     pub fn decrementRefCount(self: *Self, ptr: pointer.PersistentPtr) !void {
@@ -219,6 +220,12 @@ pub const RefCountGC = struct {
 
         self.lock.lock();
         defer self.lock.unlock();
+
+        try self.decrementRefCountLocked(ptr);
+    }
+
+    fn decrementRefCountLocked(self: *Self, ptr: pointer.PersistentPtr) !void {
+        if (ptr.isNull()) return;
 
         const base_addr = self.heap.getBaseAddress();
         const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + ptr.offset));
@@ -246,6 +253,8 @@ pub const RefCountGC = struct {
         if (obj_header.ref_count == 0) {
             try self.freeObjectGraph(&tx, ptr, 0);
         }
+
+        try self.wal.commitTransaction(&tx);
     }
 
     pub fn getRefCount(self: *Self, ptr: pointer.PersistentPtr) !u32 {
@@ -352,7 +361,7 @@ pub const RefCountGC = struct {
 
         for (self.cycle_breakers.items) |ptr| {
             if (try self.getRefCount(ptr) > 0) {
-                try self.decrementRefCount(ptr);
+                try self.decrementRefCountLocked(ptr);
                 broken += 1;
                 self.stats.cycles_broken += 1;
             }
@@ -662,15 +671,27 @@ pub const PartitionedGC = struct {
     enabled: atomic.Value(bool),
 
     pub fn init(allocator_ptr: std.mem.Allocator, partition_count: u32, partition_size: u64) !*PartitionedGC {
+        if (partition_count == 0) return error.InvalidPartitionCount;
+
         const self = try allocator_ptr.create(PartitionedGC);
         errdefer allocator_ptr.destroy(self);
 
         const partitions = try allocator_ptr.alloc(*GCPartition, partition_count);
         errdefer allocator_ptr.free(partitions);
 
+        var created: usize = 0;
+        errdefer {
+            var ci: usize = 0;
+            while (ci < created) : (ci += 1) {
+                partitions[ci].deinit();
+                allocator_ptr.destroy(partitions[ci]);
+            }
+        }
+
         for (partitions, 0..) |*p, i| {
             const partition_id = @as(u32, @intCast(i));
             p.* = try GCPartition.init(allocator_ptr, partition_id, partition_size);
+            created = i + 1;
         }
 
         self.* = PartitionedGC{

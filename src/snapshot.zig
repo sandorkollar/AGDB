@@ -421,6 +421,8 @@ pub const SnapshotManager = struct {
     }
 
     pub fn listSnapshots(self: *Self) []const SnapshotInfo {
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
         return self.snapshots.items;
     }
 
@@ -462,7 +464,18 @@ pub const SnapshotManager = struct {
 
     fn buildMerkleTree(self: *Self) !void {
         const page_count = self.heap.getSize() / page_size_bytes;
-        const node_count = page_count * 2 - 1;
+        if (page_count == 0) {
+            self.allocator.free(self.merkle_tree);
+            self.merkle_tree = &[_]MerkleNode{};
+            return;
+        }
+
+        var node_count: u64 = page_count;
+        var counter = page_count;
+        while (counter > 1) {
+            counter = (counter + 1) / 2;
+            node_count += counter;
+        }
 
         if (self.merkle_tree.len < node_count) {
             self.allocator.free(self.merkle_tree);
@@ -487,12 +500,13 @@ pub const SnapshotManager = struct {
 
         while (level_size > 1) {
             const next_level_start = level_start + level_size;
-            const next_level_size = level_size / 2;
+            const next_level_size = (level_size + 1) / 2;
 
             i = 0;
-            while ( i < next_level_size) : (i += 1) {
+            while (i < next_level_size) : (i += 1) {
                 const left_idx = level_start + i * 2;
-                const right_idx = left_idx + 1;
+                const has_right = (i * 2 + 1) < level_size;
+                const right_idx = if (has_right) left_idx + 1 else left_idx;
                 const node_idx = next_level_start + i;
 
                 var combined: [64]u8 = undefined;
@@ -502,6 +516,8 @@ pub const SnapshotManager = struct {
                 self.merkle_tree[node_idx].hash = sha256Hash(&combined);
                 self.merkle_tree[node_idx].left_offset = left_idx;
                 self.merkle_tree[node_idx].right_offset = right_idx;
+                self.merkle_tree[node_idx].flags = 0;
+                self.merkle_tree[node_idx].reserved = 0;
             }
 
             level_start = next_level_start;

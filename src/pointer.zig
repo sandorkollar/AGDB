@@ -277,11 +277,7 @@ pub const PointerTable = struct {
         while (self.entries[idx].used and iterations < self.capacity) {
             if (self.entries[idx].key.equals(key)) {
                 const value = self.entries[idx].value;
-                self.entries[idx] = Entry{
-                    .key = PersistentPtr.NULL,
-                    .value = null,
-                    .used = false,
-                };
+                self.removeAt(idx);
                 self.count -= 1;
                 return value;
             }
@@ -290,6 +286,26 @@ pub const PointerTable = struct {
         }
 
         return null;
+    }
+
+    fn removeAt(self: *PointerTable, index: u64) void {
+        var i = index;
+        var j = index;
+        var steps: u64 = 0;
+        while (steps < self.capacity) : (steps += 1) {
+            j = (j + 1) % self.capacity;
+            if (!self.entries[j].used) break;
+            const k = self.entries[j].key.hash() % self.capacity;
+            const keep = if (i <= j) (i < k and k <= j) else (i < k or k <= j);
+            if (keep) continue;
+            self.entries[i] = self.entries[j];
+            i = j;
+        }
+        self.entries[i] = Entry{
+            .key = PersistentPtr.NULL,
+            .value = null,
+            .used = false,
+        };
     }
 
     fn resize(self: *PointerTable) std.mem.Allocator.Error!void {
@@ -331,12 +347,14 @@ pub const ResidentObjectTable = struct {
     table: PointerTable,
     base_addr: [*]const u8,
     pool_uuid: u128,
+    heap_size: u64,
 
-    pub fn init(allocator_ptr: std.mem.Allocator, base_addr: [*]const u8, pool_uuid: u128, capacity: u64) !ResidentObjectTable {
+    pub fn init(allocator_ptr: std.mem.Allocator, base_addr: [*]const u8, pool_uuid: u128, heap_size: u64, capacity: u64) !ResidentObjectTable {
         return ResidentObjectTable{
             .table = try PointerTable.init(allocator_ptr, capacity),
             .base_addr = base_addr,
             .pool_uuid = pool_uuid,
+            .heap_size = heap_size,
         };
     }
 
@@ -346,6 +364,10 @@ pub const ResidentObjectTable = struct {
 
     pub fn getOrLoad(self: *ResidentObjectTable, comptime T: type, ptr: PersistentPtr) !?*T {
         if (ptr.isNull()) return null;
+        if (ptr.pool_uuid != self.pool_uuid) return error.UUIDMismatch;
+        const size: u64 = @sizeOf(T);
+        const end = std.math.add(u64, ptr.offset, size) catch return error.OutOfBounds;
+        if (end > self.heap_size) return error.OutOfBounds;
 
         const cached = self.table.get(ptr);
         if (cached) |c| {

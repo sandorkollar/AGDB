@@ -238,6 +238,13 @@ pub const Tensor = struct {
                 new_data[i] = self.data[iterator.offset];
                 _ = iterator.advance();
             }
+            var contiguous_stride: usize = 1;
+            var stride_axis: usize = self.shape.dims.len;
+            while (stride_axis > 0) {
+                stride_axis -= 1;
+                self.shape.strides[stride_axis] = contiguous_stride;
+                contiguous_stride *= self.shape.dims[stride_axis];
+            }
         }
         const new_refcount = try self.allocator.create(usize);
         errdefer self.allocator.destroy(new_refcount);

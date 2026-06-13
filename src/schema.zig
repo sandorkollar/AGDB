@@ -261,7 +261,9 @@ pub const SchemaRegistry = struct {
     }
 
     pub fn getFieldOffset(self: *Self, schema_id: u32, field_name: []const u8) ?u16 {
-        const entry = self.getSchema(schema_id) orelse return null;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const entry = self.entries.get(schema_id) orelse return null;
 
         for (entry.fields) |field| {
             const name_start = self.string_pool.items[field.name_offset..];
@@ -275,7 +277,9 @@ pub const SchemaRegistry = struct {
     }
 
     pub fn getFieldInfo(self: *Self, schema_id: u32, field_name: []const u8) ?FieldInfo {
-        const entry = self.getSchema(schema_id) orelse return null;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const entry = self.entries.get(schema_id) orelse return null;
 
         for (entry.fields) |field| {
             const name_start = self.string_pool.items[field.name_offset..];
@@ -299,8 +303,10 @@ pub const SchemaRegistry = struct {
     }
 
     pub fn compareSchemas(self: *Self, id1: u32, id2: u32) !SchemaComparison {
-        const entry1 = self.getSchema(id1) orelse return error.SchemaNotFound;
-        const entry2 = self.getSchema(id2) orelse return error.SchemaNotFound;
+        self.lock.lockShared();
+        defer self.lock.unlockShared();
+        const entry1 = self.entries.get(id1) orelse return error.SchemaNotFound;
+        const entry2 = self.entries.get(id2) orelse return error.SchemaNotFound;
 
         var comparison = SchemaComparison{
             .compatible = true,

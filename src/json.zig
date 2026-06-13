@@ -246,12 +246,20 @@ const Parser = struct {
                         if (self.pos + 4 > self.src.len) return error.UnexpectedEnd;
                         const hex = self.src[self.pos .. self.pos + 4];
                         self.pos += 4;
-                        const cp = std.fmt.parseInt(u21, hex, 16) catch return error.InvalidEscape;
+                        var cp: u21 = std.fmt.parseInt(u16, hex, 16) catch return error.InvalidEscape;
+                        if (cp >= 0xD800 and cp <= 0xDBFF) {
+                            if (self.pos + 6 > self.src.len) return error.InvalidEscape;
+                            if (self.src[self.pos] != '\\' or self.src[self.pos + 1] != 'u') return error.InvalidEscape;
+                            const low_hex = self.src[self.pos + 2 .. self.pos + 6];
+                            const low = std.fmt.parseInt(u16, low_hex, 16) catch return error.InvalidEscape;
+                            if (low < 0xDC00 or low > 0xDFFF) return error.InvalidEscape;
+                            self.pos += 6;
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (@as(u21, low) - 0xDC00);
+                        } else if (cp >= 0xDC00 and cp <= 0xDFFF) {
+                            return error.InvalidEscape;
+                        }
                         var tmp: [4]u8 = undefined;
-                        const n = std.unicode.utf8Encode(cp, &tmp) catch {
-                            try buf.appendSlice("?");
-                            continue;
-                        };
+                        const n = std.unicode.utf8Encode(cp, &tmp) catch return error.InvalidUtf8;
                         try buf.appendSlice(tmp[0..n]);
                     },
                     else => return error.InvalidEscape,
@@ -311,16 +319,18 @@ const Parser = struct {
         while (true) {
             self.skipWhitespace();
             const key = try self.parseString();
-            errdefer self.allocator.free(key);
+            var key_owned = true;
+            errdefer if (key_owned) self.allocator.free(key);
             self.skipWhitespace();
             try self.expect(':');
-            const v = try self.parseValue();
+            var v = try self.parseValue();
             const gop = try obj.getOrPut(self.allocator, key);
             if (gop.found_existing) {
-                self.allocator.free(key);
-                gop.value_ptr.*.deinit(self.allocator);
+                v.deinit(self.allocator);
+                return error.DuplicateKey;
             }
             gop.value_ptr.* = v;
+            key_owned = false;
             self.skipWhitespace();
             const c = self.peek() orelse return error.UnexpectedEnd;
             if (c == ',') {
@@ -339,7 +349,12 @@ const Parser = struct {
 pub fn parse(allocator: std.mem.Allocator, src: []const u8) !Value {
     var parser = Parser{ .src = src, .pos = 0, .allocator = allocator };
     parser.skipWhitespace();
-    const v = try parser.parseValue();
+    var v = try parser.parseValue();
+    parser.skipWhitespace();
+    if (parser.pos != parser.src.len) {
+        v.deinit(allocator);
+        return error.UnexpectedToken;
+    }
     return v;
 }
 

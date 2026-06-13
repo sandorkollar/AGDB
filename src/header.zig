@@ -6,6 +6,32 @@ pub const HEAP_VERSION: u32 = 1;
 pub const HEADER_SIZE: u64 = 256;
 pub const CACHE_LINE_SIZE: u64 = 64;
 
+pub const MIN_ALIGNMENT: u64 = 64;
+pub const MIN_BLOCK_SIZE: u64 = 64;
+pub const NUM_SIZE_CLASSES: usize = 32;
+pub const MAX_SMALL_SIZE: u64 = 4096;
+
+pub const FREE_LIST_STORAGE_OFFSET: u64 = HEADER_SIZE + @sizeOf(AllocatorMetadata);
+
+pub const SIZE_CLASSES: [NUM_SIZE_CLASSES]u64 = blk: {
+    var arr: [NUM_SIZE_CLASSES]u64 = undefined;
+    var current: u64 = MIN_BLOCK_SIZE;
+    var i: usize = 0;
+    while (i < NUM_SIZE_CLASSES) : (i += 1) {
+        arr[i] = current;
+        current = @as(u64, @intFromFloat(@ceil(@as(f64, @floatFromInt(current)) * 1.25)));
+    }
+    break :blk arr;
+};
+
+pub fn sizeClassIndex(size: u64) usize {
+    var i: usize = 0;
+    while (i < NUM_SIZE_CLASSES) : (i += 1) {
+        if (SIZE_CLASSES[i] >= size) return i;
+    }
+    return NUM_SIZE_CLASSES;
+}
+
 fn crc32cByte(crc: u32, byte: u8) u32 {
     const POLY: u32 = 0x82F63B78;
     var c = crc ^ @as(u32, byte);
@@ -48,15 +74,8 @@ pub const HeapHeader = extern struct {
         var uuid_low: u64 = undefined;
         var uuid_high: u64 = undefined;
 
-        var seed: u64 = @bitCast(std.time.timestamp());
-        var stack_anchor: u64 = heap_size;
-        seed ^= @as(u64, @intFromPtr(&stack_anchor));
-        seed ^= heap_size;
-
-        var prng = std.Random.DefaultPrng.init(seed);
-        const rand = prng.random();
-        uuid_low = rand.int(u64);
-        uuid_high = rand.int(u64);
+        std.crypto.random.bytes(std.mem.asBytes(&uuid_low));
+        std.crypto.random.bytes(std.mem.asBytes(&uuid_high));
 
         var header = HeapHeader{
             .magic = HEAP_MAGIC,
@@ -208,6 +227,9 @@ pub const ObjectHeader = extern struct {
         if (self.magic != OBJECT_MAGIC) {
             return error.InvalidObjectMagic;
         }
+        if (self.checksum != self.computeChecksum()) {
+            return error.InvalidObjectChecksum;
+        }
     }
 
     pub fn hasValidMagic(self: *const ObjectHeader) bool {
@@ -261,53 +283,126 @@ pub const ObjectHeader = extern struct {
     }
 };
 
-pub const FreeBlock = extern struct {
+pub const AllocatorMetadata = extern struct {
+    magic: u32,
+    total_allocated: u64,
+    total_freed: u64,
+    allocation_count: u64,
+    free_count: u64,
+    num_size_classes: u64,
+    free_heap_offset: u64,
+    checksum: u32,
+    reserved: [36]u8,
+
+    pub const ALLOCATOR_MAGIC: u32 = 0x414C4F43;
+
+    pub fn init() AllocatorMetadata {
+        return AllocatorMetadata{
+            .magic = ALLOCATOR_MAGIC,
+            .total_allocated = 0,
+            .total_freed = 0,
+            .allocation_count = 0,
+            .free_count = 0,
+            .num_size_classes = NUM_SIZE_CLASSES,
+            .free_heap_offset = 0,
+            .checksum = 0,
+            .reserved = [_]u8{0} ** 36,
+        };
+    }
+
+    pub fn validate(self: *const AllocatorMetadata) !void {
+        if (self.magic != ALLOCATOR_MAGIC) {
+            return error.InvalidAllocatorMagic;
+        }
+    }
+
+    pub fn canRepair(self: *const AllocatorMetadata) !bool {
+        return self.magic == ALLOCATOR_MAGIC;
+    }
+
+    pub fn updateChecksum(self: *AllocatorMetadata) void {
+        self.checksum = self.computeChecksum();
+    }
+
+    pub fn computeChecksum(self: *const AllocatorMetadata) u32 {
+        const bytes = std.mem.asBytes(self);
+        var crc: u32 = 0xFFFFFFFF;
+        for (bytes[0..@offsetOf(AllocatorMetadata, "checksum")]) |byte| {
+            crc = crc32cByte(crc, byte);
+        }
+        return crc ^ 0xFFFFFFFF;
+    }
+};
+
+pub const FreeListNode = extern struct {
     magic: u32,
     size: u64,
-    prev_offset: u64,
-    next_offset: u64,
+    prev: u64,
+    next: u64,
     checksum: u32,
     reserved: u32,
 
-    pub const FREE_MAGIC: u32 = 0xFEEDFACE;
+    pub const NODE_MAGIC: u32 = 0x46524545;
 
-    pub fn init(size: u64) FreeBlock {
-        var block = FreeBlock{
-            .magic = FREE_MAGIC,
+    pub fn init(size: u64) FreeListNode {
+        return FreeListNode{
+            .magic = NODE_MAGIC,
             .size = size,
-            .prev_offset = 0,
-            .next_offset = 0,
+            .prev = 0,
+            .next = 0,
             .checksum = 0,
             .reserved = 0,
         };
-        block.checksum = block.computeChecksum();
-        return block;
     }
 
-    pub fn validate(self: *const FreeBlock) !void {
-        if (self.magic != FREE_MAGIC) {
-            return error.InvalidFreeBlockMagic;
+    pub fn validate(self: *const FreeListNode) !void {
+        if (self.magic != NODE_MAGIC) {
+            return error.InvalidFreeListMagic;
         }
-    }
-
-    pub fn computeChecksum(self: *const FreeBlock) u32 {
-        const bytes = std.mem.asBytes(self);
-        var crc: u32 = 0xFFFFFFFF;
-        const skip_start = @offsetOf(FreeBlock, "checksum");
-        const skip_end = skip_start + @sizeOf(u32);
-
-        for (bytes, 0..) |byte, i| {
-            if (i >= skip_start and i < skip_end) continue;
-            crc = crc32cByte(crc, byte);
-        }
-
-        return crc ^ 0xFFFFFFFF;
-    }
-
-    pub fn updateChecksum(self: *FreeBlock) void {
-        self.checksum = self.computeChecksum();
     }
 };
+
+pub fn freeListNodeAt(base_addr: [*]u8, offset: u64) *FreeListNode {
+    return @ptrCast(@alignCast(base_addr + offset));
+}
+
+pub fn freeListPush(base_addr: [*]u8, head: *u64, offset: u64, size: u64) void {
+    const node = freeListNodeAt(base_addr, offset);
+    node.* = FreeListNode.init(size);
+    node.next = head.*;
+    node.prev = 0;
+    if (head.* != 0) {
+        const old_head = freeListNodeAt(base_addr, head.*);
+        old_head.prev = offset;
+    }
+    head.* = offset;
+}
+
+pub fn freeListUnlink(base_addr: [*]u8, head: *u64, offset: u64) void {
+    const node = freeListNodeAt(base_addr, offset);
+    if (node.prev != 0) {
+        const prev_node = freeListNodeAt(base_addr, node.prev);
+        prev_node.next = node.next;
+    }
+    if (node.next != 0) {
+        const next_node = freeListNodeAt(base_addr, node.next);
+        next_node.prev = node.prev;
+    }
+    if (head.* == offset) {
+        head.* = node.next;
+    }
+}
+
+pub fn freeListContains(base_addr: [*]u8, head: u64, offset: u64) bool {
+    var cur = head;
+    while (cur != 0) {
+        if (cur == offset) return true;
+        const node = freeListNodeAt(base_addr, cur);
+        node.validate() catch return false;
+        cur = node.next;
+    }
+    return false;
+}
 
 test "header initialization and validation" {
     const testing = std.testing;

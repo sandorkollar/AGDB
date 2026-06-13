@@ -411,14 +411,16 @@ pub const WAL = struct {
 
     fn writerThreadFn(self: *WAL) void {
         while (!self.shutdown_flag.load(.acquire)) {
-            self.drainAsyncQueueOnce() catch {};
-            std.time.sleep(1 * std.time.ns_per_ms);
+            const did_work = self.drainAsyncQueueOnce() catch false;
+            if (!did_work) std.time.sleep(1 * std.time.ns_per_ms);
         }
-        self.drainAsyncQueueOnce() catch {};
+        _ = self.drainAsyncQueueOnce() catch false;
     }
 
-    fn drainAsyncQueueOnce(self: *WAL) !void {
+    fn drainAsyncQueueOnce(self: *WAL) !bool {
+        var did_work = false;
         while (self.async_queue.dequeue()) |raw| {
+            did_work = true;
             const entry: *AsyncEntry = @ptrCast(@alignCast(raw));
             self.lock.lock();
             const write_result = self.writeTransactionRecordsLocked(&entry.wal_tx);
@@ -431,6 +433,7 @@ pub const WAL = struct {
             self.lock.unlock();
             entry.completed.store(true, .release);
         }
+        return did_work;
     }
 
     pub fn setAppendHook(self: *Self, hook: AppendHookFn, ctx: *anyopaque) void {
@@ -444,7 +447,7 @@ pub const WAL = struct {
     }
 
     pub fn flushAsyncQueue(self: *WAL) !void {
-        try self.drainAsyncQueueOnce();
+        _ = try self.drainAsyncQueueOnce();
     }
 
     pub fn enqueueAsyncTransaction(self: *WAL, tx: *Transaction) !*AsyncEntry {
@@ -475,7 +478,7 @@ pub const WAL = struct {
 
     pub fn waitAsync(self: *WAL, entry: *AsyncEntry) !void {
         while (!entry.completed.load(.acquire)) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch std.atomic.spinLoopHint();
         }
         const r = entry.result;
         entry.wal_tx.deinit();
@@ -1213,9 +1216,12 @@ pub const WAL = struct {
         if (record.isUndoCompressed()) {
             if (stored.len < 8) return error.InvalidUndoSize;
             const uncompressed_size = std.mem.readInt(u64, stored[0..8], .little);
-            _ = uncompressed_size;
             const compressed_payload = stored[8..];
             const decompressed = try mem_utils.decompressMemory(compressed_payload, self.allocator);
+            if (@as(u64, @intCast(decompressed.len)) != uncompressed_size) {
+                self.allocator.free(decompressed);
+                return error.UndoSizeMismatch;
+            }
             return decompressed;
         }
 

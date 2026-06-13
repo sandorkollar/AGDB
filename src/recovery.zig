@@ -298,6 +298,7 @@ pub const RecoveryEngine = struct {
                     try self.redoRecord(&record);
                     self.stats.records_redone += 1;
                 },
+                .begin, .commit, .rollback, .checkpoint => {},
                 else => {
                     self.stats.errors += 1;
                     return error.InvalidRecord;
@@ -361,9 +362,9 @@ pub const RecoveryEngine = struct {
             .heap_extend => {
                 if (record.size > 0) {
                     const current_size = self.heap.getSize();
-                    const target_size = record.offset + record.size;
+                    const target_size = try std.math.add(u64, record.offset, record.size);
                     if (current_size < target_size) {
-                        try self.heap.expand(target_size - current_size);
+                        try self.heap.expand(target_size);
                     }
                 }
             },
@@ -451,6 +452,7 @@ pub const RecoveryEngine = struct {
                     try self.undoFreeListRemove(&record);
                     self.stats.records_undone += 1;
                 },
+                .begin, .commit, .rollback, .checkpoint => {},
                 else => {
                     self.stats.errors += 1;
                     return error.IncompleteTransaction;

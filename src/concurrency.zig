@@ -1049,7 +1049,7 @@ pub const LockGuard = struct {
     }
 
     pub fn deinit(self: *LockGuard) void {
-        self.release() catch unreachable;
+        self.release() catch {};
     }
 };
 
@@ -1081,7 +1081,7 @@ pub const ReadGuard = struct {
     }
 
     pub fn deinit(self: *ReadGuard) void {
-        self.release() catch unreachable;
+        self.release() catch {};
     }
 };
 
@@ -1113,7 +1113,7 @@ pub const WriteGuard = struct {
     }
 
     pub fn deinit(self: *WriteGuard) void {
-        self.release() catch unreachable;
+        self.release() catch {};
     }
 };
 

@@ -6,10 +6,10 @@ const wal_mod = @import("wal.zig");
 const mem_utils = @import("mem_utils.zig");
 const topology_mod = @import("topology.zig");
 
-pub const MIN_ALIGNMENT: u64 = 64;
-pub const MIN_BLOCK_SIZE: u64 = 64;
-pub const NUM_SIZE_CLASSES: usize = 32;
-pub const MAX_SMALL_SIZE: u64 = 4096;
+pub const MIN_ALIGNMENT = header.MIN_ALIGNMENT;
+pub const MIN_BLOCK_SIZE = header.MIN_BLOCK_SIZE;
+pub const NUM_SIZE_CLASSES = header.NUM_SIZE_CLASSES;
+pub const MAX_SMALL_SIZE = header.MAX_SMALL_SIZE;
 
 pub const CACHE_LINE_BYTES: usize = 64;
 pub const SLAB_CACHE_LINES: usize = 8;
@@ -91,98 +91,9 @@ pub const SizeClass = struct {
     count: u64,
 };
 
-pub const AllocatorMetadata = extern struct {
-    magic: u32,
-    total_allocated: u64,
-    total_freed: u64,
-    allocation_count: u64,
-    free_count: u64,
-    num_size_classes: u64,
-    free_heap_offset: u64,
-    checksum: u32,
-    reserved: [36]u8,
+pub const AllocatorMetadata = header.AllocatorMetadata;
 
-    pub const ALLOCATOR_MAGIC: u32 = 0x414C4F43;
-
-    pub fn init() AllocatorMetadata {
-        return AllocatorMetadata{
-            .magic = ALLOCATOR_MAGIC,
-            .total_allocated = 0,
-            .total_freed = 0,
-            .allocation_count = 0,
-            .free_count = 0,
-            .num_size_classes = NUM_SIZE_CLASSES,
-            .free_heap_offset = 0,
-            .checksum = 0,
-            .reserved = [_]u8{0} ** 36,
-        };
-    }
-
-    pub fn validate(self: *const AllocatorMetadata) !void {
-        if (self.magic != ALLOCATOR_MAGIC) {
-            return error.InvalidAllocatorMagic;
-        }
-    }
-
-    pub fn canRepair(self: *const AllocatorMetadata) !bool {
-        return self.magic == ALLOCATOR_MAGIC;
-    }
-
-    pub fn updateChecksum(self: *AllocatorMetadata) void {
-        self.checksum = self.computeChecksum();
-    }
-
-    pub fn computeChecksum(self: *const AllocatorMetadata) u32 {
-        const bytes = std.mem.asBytes(self);
-        var crc: u32 = 0xFFFFFFFF;
-        for (bytes[0..@offsetOf(AllocatorMetadata, "checksum")]) |byte| {
-            crc = crc32cByte(crc, byte);
-        }
-        return crc ^ 0xFFFFFFFF;
-    }
-
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            if ((c & 1) != 0) {
-                c = (c >> 1) ^ POLY;
-            } else {
-                c = c >> 1;
-            }
-        }
-        return c;
-    }
-};
-
-pub const FreeListNode = extern struct {
-    magic: u32,
-    size: u64,
-    prev: u64,
-    next: u64,
-    checksum: u32,
-    reserved: u32,
-
-    pub const NODE_MAGIC: u32 = 0x46524545;
-
-    pub fn init(size: u64) FreeListNode {
-        return FreeListNode{
-            .magic = NODE_MAGIC,
-            .size = size,
-            .prev = 0,
-            .next = 0,
-            .checksum = 0,
-            .reserved = 0,
-        };
-    }
-
-    pub fn validate(self: *const FreeListNode) !void {
-        if (self.magic != NODE_MAGIC) {
-            return error.InvalidFreeListMagic;
-        }
-    }
-};
+pub const FreeListNode = header.FreeListNode;
 
 pub const PersistentAllocator = struct {
     heap: *pheap.PersistentHeap,
@@ -239,11 +150,18 @@ pub const PersistentAllocator = struct {
         const free_list_storage_offset = metadata_offset + @sizeOf(AllocatorMetadata);
         const free_list_storage: *[NUM_SIZE_CLASSES]u64 = @ptrCast(@alignCast(base_addr + free_list_storage_offset));
 
+        const heap_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
+        var large_head: u64 = 0;
         if (!needs_init) {
             i = 0;
             while (i < NUM_SIZE_CLASSES) : (i += 1) {
                 free_list_heads[i] = free_list_storage[i];
             }
+            large_head = heap_header.allocator_offset;
+        } else {
+            heap_header.allocator_offset = 0;
+            heap_header.updateChecksum();
+            try heap.flushRange(@sizeOf(header.HeapHeader));
         }
 
         var mpsc_lanes: [NUM_SIZE_CLASSES]*topology_mod.MPSCQueue(u64) = undefined;
@@ -269,7 +187,7 @@ pub const PersistentAllocator = struct {
             .base_addr = base_addr,
             .allocator = allocator_ptr,
             .free_list_heads = free_list_heads,
-            .large_free_list = 0,
+            .large_free_list = large_head,
             .lock = std.Thread.Mutex{},
             .mpsc_lanes = mpsc_lanes,
         };
@@ -312,7 +230,10 @@ pub const PersistentAllocator = struct {
     pub fn alloc(self: *Self, size: u64, alignment: u64) !pointer.PersistentPtr {
         self.lock.lock();
         defer self.lock.unlock();
+        return self.allocLocked(size, alignment);
+    }
 
+    fn allocLocked(self: *Self, size: u64, alignment: u64) !pointer.PersistentPtr {
         const actual_alignment = @max(alignment, MIN_ALIGNMENT);
         const actual_size = alignTo(@max(size, MIN_BLOCK_SIZE), actual_alignment);
 
@@ -347,6 +268,7 @@ pub const PersistentAllocator = struct {
 
         try self.heap.flushRange(offset + @sizeOf(header.ObjectHeader));
         try self.wal.appendRecord(&tx, .allocate, offset, actual_size);
+        try self.wal.commitTransaction(&tx);
 
         return pointer.PersistentPtr{
             .pool_uuid = self.heap.getPoolUUID(),
@@ -403,6 +325,8 @@ pub const PersistentAllocator = struct {
         self.metadata.free_count += 1;
         self.metadata.updateChecksum();
 
+        try self.wal.commitTransaction(&tx);
+
         try self.heap.flushRange(offset + @sizeOf(header.ObjectHeader));
     }
 
@@ -417,6 +341,9 @@ pub const PersistentAllocator = struct {
             return self.alloc(new_size, alignment);
         }
 
+        self.lock.lock();
+        defer self.lock.unlock();
+
         const offset = ptr.offset;
         const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(self.base_addr + offset));
         try obj_header.validate();
@@ -427,8 +354,8 @@ pub const PersistentAllocator = struct {
             return ptr;
         }
 
-        const new_ptr = try self.alloc(new_size, alignment);
-        errdefer self.free(new_ptr) catch {};
+        const new_ptr = try self.allocLocked(new_size, alignment);
+        errdefer self.freeLocked(new_ptr) catch {};
 
         const old_data_start = offset + @sizeOf(header.ObjectHeader);
         const new_data_start = new_ptr.offset + @sizeOf(header.ObjectHeader);
@@ -438,7 +365,7 @@ pub const PersistentAllocator = struct {
         const dest = self.base_addr + new_data_start;
         @memcpy(dest[0..copy_size], src[0..copy_size]);
 
-        try self.free(ptr);
+        try self.freeLocked(ptr);
 
         return new_ptr;
     }
@@ -521,7 +448,12 @@ pub const PersistentAllocator = struct {
             next_node.prev = best_prev;
         }
 
+        const heap_header: *header.HeapHeader = @ptrCast(@alignCast(self.base_addr));
+        heap_header.allocator_offset = self.large_free_list;
+        heap_header.updateChecksum();
+
         try self.wal.appendRecord(tx, .free_list_remove, best_offset, node.size);
+        try self.heap.flushRange(@sizeOf(header.HeapHeader));
 
         return best_offset;
     }
@@ -579,21 +511,22 @@ pub const PersistentAllocator = struct {
 
         self.large_free_list = offset;
 
+        const heap_header: *header.HeapHeader = @ptrCast(@alignCast(self.base_addr));
+        heap_header.allocator_offset = self.large_free_list;
+        heap_header.updateChecksum();
+
         try self.wal.appendRecord(tx, .free_list_add, offset, size);
         try self.heap.flushRange(offset + @sizeOf(FreeListNode));
+        try self.heap.flushRange(@sizeOf(header.HeapHeader));
     }
 
     fn getSizeClassIndex(self: *const Self, size: u64) usize {
-        var i: usize = 0;
-        while (i < NUM_SIZE_CLASSES) : (i += 1) {
-            if (self.size_classes[i].size >= size) {
-                return i;
-            }
-        }
-        return NUM_SIZE_CLASSES - 1;
+        _ = self;
+        return header.sizeClassIndex(size);
     }
 
     pub fn getUsedSize(self: *const Self) u64 {
+        if (self.metadata.total_allocated < self.metadata.total_freed) return 0;
         return self.metadata.total_allocated - self.metadata.total_freed;
     }
 
@@ -611,7 +544,8 @@ pub const PersistentAllocator = struct {
             self.base_addr + @as(usize, @intCast(ptr.offset)),
         ));
         const size = obj_hdr.size;
-        const class_idx = self.getSizeClassIndex(size);
+        var class_idx = self.getSizeClassIndex(size);
+        if (class_idx >= NUM_SIZE_CLASSES) class_idx = NUM_SIZE_CLASSES - 1;
         try self.mpsc_lanes[class_idx].enqueue(ptr.offset);
     }
 
@@ -688,7 +622,12 @@ pub const PersistentAllocator = struct {
         _ = buf_align;
         _ = ret_addr;
         const self: *Self = @ptrCast(@alignCast(ctx));
-        const offset = @intFromPtr(buf.ptr) - @intFromPtr(self.base_addr);
+        const buf_addr = @intFromPtr(buf.ptr);
+        const base = @intFromPtr(self.base_addr);
+        if (buf_addr < base) return;
+        const offset = buf_addr - base;
+        const heap_size: usize = @intCast(self.heap.getSize());
+        if (offset >= heap_size) return;
         const ptr = pointer.PersistentPtr{
             .pool_uuid = self.heap.getPoolUUID(),
             .offset = offset,
@@ -698,8 +637,8 @@ pub const PersistentAllocator = struct {
 };
 
 fn alignTo(value: u64, alignment: u64) u64 {
-    const mask = alignment - 1;
-    return (value + mask) & ~mask;
+    if (alignment <= 1) return value;
+    return ((value + alignment - 1) / alignment) * alignment;
 }
 
 test "persistent allocator" {
